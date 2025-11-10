@@ -1,0 +1,30 @@
+clear all
+close all
+
+folderName = "C:\Users\moqian\Desktop\food-11\train"
+imds = imageDatastore(folderName, ...
+    'IncludeSubfolders', true, ...
+    'LabelSource', "foldernames");
+[imdsTrain,imdsValidation] = splitEachLabel(imds, 0.7, "randomized");
+
+inpSize = [512 512 3]; 
+
+augmenter = imageDataAugmenter(...
+    'RandXReflection', true, ...
+    'RandRotation', [-10 10], ...
+    'RandScale', [0.9 1.1], ...
+    'RandXTranslation', [-5 5], ...
+    'RandYTranslation', [-5 5], ...
+    'RandXShear', [-5 5]);
+
+augimdsTrain = augmentedImageDatastore(imageSize, imdsTrain, ...
+    'DataAugmentation', augmenter);
+
+augimdsValidation = augmentedImageDatastore(imageSize, imdsValidation);
+numImages = numel(imds.Labels);
+idx = randperm(numImages,16);
+I = imtile(imds, 'Frames', idx);
+figure
+imshow(I)
+classNames = categories(imds.Labels);
+numClasses = numel(classNames);
