@@ -1,7 +1,13 @@
 close all
-net = imagePretrainedNetwork("googlenet", NumClasses=numClasses);
-inputSize = networkInputSize(net);
-fprintf('GoogleNet 标准输入尺寸为：%dx%dx%d\n', inputSize(1), inputSize(2), inputSize(3));
+
+
+testFolder = "C:\Users\moqian\Desktop\food-11\test";
+% ResNet-18 transfer learning
+net = resnet18;
+inputSize = net.Layers(1).InputSize;
+
+% augmenter data
+
 augmenter = imageDataAugmenter(...
     'RandXReflection', true, ...
     'RandRotation', [-10 10], ...
@@ -12,37 +18,122 @@ augmenter = imageDataAugmenter(...
 
 augimdsTrain = augmentedImageDatastore(inputSize(1:2), imdsTrain, ...
     DataAugmentation=augmenter);
-
 augimdsValidation = augmentedImageDatastore(inputSize(1:2), imdsValidation);
 
-[layerName,learnableNames] = networkHead(net);
-net = freezeNetwork(net,LayerNamesToIgnore=layerName);
+% remplace les deux derniers layers
 
-% layers = [
-%     imageInputLayer(inputSize)
-%     convolution2dLayer(5,20)
-%     batchNormalizationLayer
-%     reluLayer
-%     maxPooling2dLayer(2, 'Stride', 2,'Name','maxpooling1')
-%     convolution2dLayer(5,40,"padding",1,'Name','conv2')%padding dimension d'entree=dim sortie
-%     batchNormalizationLayer
-%     reluLayer('Name','relu2')
-%     maxPooling2dLayer(2, 'Stride', 2,'Name','maxpooling2')
-%     fullyConnectedLayer(numClasses,'Name','fullyconnected',"WeightsInitializer","narrow-normal")
-%     softmaxLayer('Name','softmax')
-%     classificationLayer('Name','classification') ];
+lgraph = layerGraph(net);
+newFCLayer = fullyConnectedLayer(numClasses, ...
+    'Name','new_fc', ...
+    'WeightLearnRateFactor',10, ...
+    'BiasLearnRateFactor',10);
+newClassLayer = classificationLayer('Name','new_classoutput');
+lgraph = replaceLayer(lgraph, 'fc1000', newFCLayer);
+lgraph = replaceLayer(lgraph, 'ClassificationLayer_predictions', newClassLayer);
 
-miniBatchSize = 500;
-options = trainingOptions('sgdm', ...
-    "L2Regularization",0.001,...
-    'InitialLearnRate',0.001, ...
-    'MaxEpochs',16, ...
-    'Shuffle','every-epoch', ...
-     'MiniBatchSize', miniBatchSize,...
-     'ValidationData',{imgDataTest,labelsTest},...
-     'ValidationFrequency',40,...
-    'Verbose',false, ...
-    'Plots','training-progress');
 
-net=imagePretrainedNetwor("googlnet",NumClasses=numClasses);
-inputSize = networkInputSize(net);
+
+miniBatchSize = 128;
+initialLearnRate = 1e-4;
+
+options = trainingOptions("adam", ...
+    "L2Regularization",0.01,...
+    InitialLearnRate=initialLearnRate, ...
+    MiniBatchSize=miniBatchSize, ...
+    MaxEpochs=20, ... 
+    Shuffle="every-epoch", ...
+    ValidationData=augimdsValidation, ... 
+    ValidationFrequency=5, ... 
+    Verbose=false, ...
+    Plots="training-progress");
+
+disp('--- 开始训练 ResNet-18 迁移学习网络 ---');
+net = trainNetwork(augimdsTrain, lgraph, options);
+disp('--- 训练完成 ---');
+
+% Calculer f1-score,evaluer le reseau
+[YPred, scores] = classify(net, augimdsValidation);
+YValidation = imdsValidation.Labels;
+
+figure;
+confusionchart(YValidation, YPred);
+title('Confusion Matrix on Validation Data');
+
+% 初始化分数数组
+precision = zeros(1, numClasses);
+recall = zeros(1, numClasses);
+f1Score = zeros(1, numClasses);
+
+disp('Evaluation sur test data');
+fprintf('%-20s %10s %10s %10s\n', 'Class', 'Precision', 'Recall', 'F1_Score');
+fprintf('%-20s %10s %10s %10s\n', repmat('-', 1, 20), repmat('-', 1, 10), repmat('-', 1, 10), repmat('-', 1, 10));
+
+for i = 1:numClasses
+    currentClass = classNames{i};
+    TP = sum(YValidation == currentClass & YPred == currentClass);
+    FP = sum(YValidation ~= currentClass & YPred == currentClass);
+    FN = sum(YValidation == currentClass & YPred ~= currentClass);
+    
+    
+    precision(i) = TP / (TP + FP + eps); 
+    recall(i) = TP / (TP + FN + eps);
+    
+    denominator = (precision(i) + recall(i) + eps);
+    f1Score(i) = 2 * (precision(i) * recall(i)) / denominator;
+
+    
+    if isnan(precision(i))
+        precision(i) = 0;
+    end
+    if isnan(recall(i))
+        recall(i) = 0;
+    end
+    if isnan(f1Score(i))
+        f1Score(i) = 0;
+    end
+    
+    fprintf('%-20s %10.4f %10.4f %10.4f\n', currentClass, precision(i), recall(i), f1Score(i));
+end
+
+macroF1Score = mean(f1Score);
+fprintf('\n----------------------------------------------------\n');
+fprintf('Macro-Averaged F1-Score (Validation): %.4f\n', macroF1Score);
+fprintf('----------------------------------------------------\n');
+
+% Enregistrer le resultat
+
+imdsTest = imageDatastore(testFolder, ...
+    'IncludeSubfolders', false, ...
+    'LabelSource', 'none');
+
+% normaliser la t
+augimdsTest = augmentedImageDatastore(inputSize(1:2), imdsTest);
+
+% 对测试集进行预测
+[YPredTest, ~] = classify(net, augimdsTest);
+
+[~, testNames, ~] = cellfun(@fileparts, imdsTest.Files, 'UniformOutput', false);
+
+jsonMap = containers.Map('KeyType', 'char', 'ValueType', 'char'); 
+for i = 1:numel(testNames)
+    key = testNames{i};
+    value = char(YPredTest(i));
+    jsonMap(key) = value;
+end
+
+% 编码为 JSON 字符串
+jsonStr = jsonencode(jsonMap);
+
+% 保存为 JSON 文件
+outputFile = fullfile(pwd, "test_predictions_Restnet_RELU10-2.json"); 
+fid = fopen(outputFile, 'w');
+if fid == -1
+    error('Erreur chemin,peut pas créer le fichier json');
+end
+fprintf(fid, '%s', jsonStr);
+fclose(fid);
+fprintf('\n json enregistré %s\n', outputFile);
+
+
+
+

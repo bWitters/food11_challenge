@@ -1,0 +1,148 @@
+inputSize = [64 64 3]; 
+
+% 定义自定义的卷积神经网络层
+layers = [
+    imageInputLayer(inputSize, 'Name', 'input')
+    
+    convolution2dLayer(5, 20, 'Name', 'conv1')
+    batchNormalizationLayer('Name', 'bn1')
+    reluLayer('Name', 'relu1')
+    maxPooling2dLayer(2, 'Stride', 2, 'Name', 'maxpooling1')
+    
+    % padding='same' 确保输出尺寸与输入尺寸（在步长为1的情况下）一致，
+    % 但在这个架构中，您原先的 padding=1 应该可以保持维度。
+    convolution2dLayer(5, 40, 'Padding', 1, 'Name', 'conv2')
+    batchNormalizationLayer('Name', 'bn2')
+    reluLayer('Name', 'relu2')
+    maxPooling2dLayer(2, 'Stride', 2, 'Name', 'maxpooling2')
+    
+    % 将特征图展平为向量
+    fullyConnectedLayer(numClasses, 'Name', 'fullyconnected', 'WeightsInitializer', 'narrow-normal')
+    
+    softmaxLayer('Name', 'softmax')
+    classificationLayer('Name', 'classification')
+];
+
+% --- 3. 数据增强与 datastore 创建 ---
+
+augmenter = imageDataAugmenter(...
+    'RandXReflection', true, ...
+    'RandRotation', [-10 10], ...
+    'RandScale', [0.9 1.1], ...
+    'RandXTranslation', [-5 5], ...
+    'RandYTranslation', [-5 5], ...
+    'RandXShear', [-5 5]);
+
+% 注意：这里将 imdsTrain 和 imdsValidation 的图片统一调整到 inputSize
+augimdsTrain = augmentedImageDatastore(inputSize(1:2), imdsTrain, ...
+    'DataAugmentation', augmenter);
+augimdsValidation = augmentedImageDatastore(inputSize(1:2), imdsValidation);
+
+% --- 4. 训练选项和网络训练 ---
+
+miniBatchSize = 128; % 可以改
+initialLearnRate = 1e-4; % 可以改
+
+options = trainingOptions("adam", ...
+    "L2Regularization", 0.01, ...
+    'InitialLearnRate', initialLearnRate, ...
+    'MiniBatchSize', miniBatchSize, ...
+    'MaxEpochs', 3, ... % 可以根据需要增加
+    'Shuffle', "every-epoch", ...
+    'ValidationData', augimdsValidation, ... % 使用验证集进行监控
+    'ValidationFrequency', 5, ... % 每 5 次迭代运行一次验证
+    'Verbose', false, ...
+    'Plots', "training-progress");
+
+disp('--- 开始训练自定义网络（无迁移学习） ---');
+% 使用自定义的 layers 数组进行训练
+net = trainNetwork(augimdsTrain, layers, options); 
+disp('--- 训练完成 ---');
+
+% --- 5. 验证集评估 ---
+
+% 获取网络期望的输入大小（对于自定义网络就是 inputSize）
+netInputSize = net.Layers(1).InputSize; 
+
+[YPred, scores] = classify(net, augimdsValidation);
+YValidation = imdsValidation.Labels;
+
+figure;
+confusionchart(YValidation, YPred);
+title('Confusion Matrix on Validation Data');
+
+% 初始化分数数组
+precision = zeros(1, numClasses);
+recall = zeros(1, numClasses);
+f1Score = zeros(1, numClasses);
+
+disp('--- 类别级性能分数 (验证集) ---');
+fprintf('%-20s %10s %10s %10s\n', 'Class', 'Precision', 'Recall', 'F1_Score');
+fprintf('%-20s %10s %10s %10s\n', repmat('-', 1, 20), repmat('-', 1, 10), repmat('-', 1, 10), repmat('-', 1, 10));
+
+for i = 1:numClasses
+    currentClass = classNames{i};
+    TP = sum(YValidation == currentClass & YPred == currentClass);
+    FP = sum(YValidation ~= currentClass & YPred == currentClass);
+    FN = sum(YValidation == currentClass & YPred ~= currentClass);
+    
+    % 使用 eps 防止除以零
+    precision(i) = TP / (TP + FP + eps); 
+    recall(i) = TP / (TP + FN + eps);
+    
+    denominator = (precision(i) + recall(i) + eps);
+    f1Score(i) = 2 * (precision(i) * recall(i)) / denominator;
+
+    % 修复：将 NaN 结果替换为 0
+    % 这样可以确保在宏平均计算中，性能无法衡量的类别被视为 0。
+    if isnan(precision(i))
+        precision(i) = 0;
+    end
+    if isnan(recall(i))
+        recall(i) = 0;
+    end
+    if isnan(f1Score(i))
+        f1Score(i) = 0;
+    end
+    
+    % 直接使用 fprintf 输出结果，避免使用 table
+    fprintf('%-20s %10.4f %10.4f %10.4f\n', currentClass, precision(i), recall(i), f1Score(i));
+end
+
+macroF1Score = mean(f1Score);
+fprintf('\n----------------------------------------------------\n');
+fprintf('Macro-Averaged F1-Score (Validation): %.4f\n', macroF1Score);
+fprintf('----------------------------------------------------\n');
+% --- 6. 测试集预测与结果保存 ---
+testFolder="C:\Users\moqian\Desktop\food-11\test";
+% 创建测试集的 imageDatastore（不带标签）
+imdsTest = imageDatastore(testFolder, ...
+    'IncludeSubfolders', false, ...
+    'LabelSource', 'none');
+
+% 统一输入大小（与训练网络一致）
+augimdsTest = augmentedImageDatastore(netInputSize(1:2), imdsTest);
+
+[YPreedTest,~]=classify(net,augimdsTest);
+
+[~, testNames, ~] = cellfun(@fileparts, imdsTest.Files, 'UniformOutput', false);
+
+jsonMap = containers.Map('KeyType', 'char', 'ValueType', 'char'); 
+for i = 1:numel(testNames)
+    key = testNames{i};
+    value = char(YPredTest(i));
+    jsonMap(key) = value;
+end
+
+% 编码为 JSON 字符串
+jsonStr = jsonencode(jsonMap);
+
+% 保存为 JSON 文件
+outputFile = fullfile(pwd, "test_predictions_transfer_learning.json"); 
+fid = fopen(outputFile, 'w');
+if fid == -1
+    error('Erreur chemin,peut pas créer le fichier json');
+end
+fprintf(fid, '%s', jsonStr);
+fclose(fid);
+fprintf('\n json enregistré %s\n', outputFile);
