@@ -6,18 +6,9 @@ testFolder = "C:\Users\moqian\Desktop\food-11\test";
 net = resnet18;
 inputSize = net.Layers(1).InputSize;
 
-% augmenter data
 
-augmenter = imageDataAugmenter(...
-    'RandXReflection', true, ...
-    'RandRotation', [-10 10], ...
-    'RandScale', [0.9 1.1], ...
-    'RandXTranslation', [-5 5], ...
-    'RandYTranslation', [-5 5], ...
-    'RandXShear', [-5 5]);
 
-augimdsTrain = augmentedImageDatastore(inputSize(1:2), imdsTrain, ...
-    DataAugmentation=augmenter);
+augimdsTrain = augmentedImageDatastore(inputSize(1:2), imdsTrain);
 augimdsValidation = augmentedImageDatastore(inputSize(1:2), imdsValidation);
 
 % remplace les deux derniers layers
@@ -131,7 +122,6 @@ fprintf(fid, '%s', jsonStr);
 fclose(fid);
 fprintf('\n json enregistré %s\n', outputFile);
 
-
 if isfile(gpuPowerLog)
 powerData = readmatrix(gpuPowerLog);
 avgPower = mean(powerData);
@@ -147,4 +137,3 @@ sampleInterval = 500;
 gpuPowerLog = fullfile(pwd,'gpu_power_log.txt');
 % commencer enregistrer la puissance de GPU
 system(sprintf('start /B nvidia-smi --loop-ms=%d --query-gpu=power.draw --format=csv,noheader,nounits > "%s"', sampleInterval, gpuPowerLog));
-

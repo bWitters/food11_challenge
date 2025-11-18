@@ -37,7 +37,7 @@ miniBatchSize = 128;
 initialLearnRate = 1e-4;
 
 options = trainingOptions("adam", ...
-    "L2Regularization",0.1,...
+    "L2Regularization",0.05,...
     InitialLearnRate=initialLearnRate, ...
     MiniBatchSize=miniBatchSize, ...
     MaxEpochs=20, ... 
@@ -122,7 +122,7 @@ end
 jsonStr = jsonencode(jsonMap);
 
 % enregistrer le fichier json (resultat)
-outputFile = fullfile(pwd, "test_predictions_Restnet_RELU10-1.json"); 
+outputFile = fullfile(pwd, "test_predictions_Restnet_RELU5_10-2.json"); 
 fid = fopen(outputFile, 'w');
 if fid == -1
     error('Erreur chemin,peut pas créer le fichier json');
@@ -132,5 +132,19 @@ fclose(fid);
 fprintf('\n json enregistré %s\n', outputFile);
 
 
+if isfile(gpuPowerLog)
+powerData = readmatrix(gpuPowerLog);
+avgPower = mean(powerData);
+energyWh = avgPower * (trainTime/3600); % Wh
+fprintf('Average GPU Power: %.2f W\n', avgPower);
+fprintf('Estimated GPU Energy Consumption: %.4f Wh\n', energyWh);
+else
+warning('GPU power log not found. Energy not computed.');
+end
 
+% temps entre echantillonage en echelle ms
+sampleInterval = 500; 
+gpuPowerLog = fullfile(pwd,'gpu_power_log.txt');
+% commencer enregistrer la puissance de GPU
+system(sprintf('start /B nvidia-smi --loop-ms=%d --query-gpu=power.draw --format=csv,noheader,nounits > "%s"', sampleInterval, gpuPowerLog));
 
