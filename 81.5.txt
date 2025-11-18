@@ -1,0 +1,210 @@
+%% food11_googlenet_optimized.m
+% 优化版（GoogLeNet）：增强 + 类均衡 + 冻结大部分层 + LR schedule + JSON 输出
+
+clear; clc; close all;
+
+%% --------- 用户可修改的路径与参数 ----------
+baseFolder = 'D:\4TCS1\TIP\food-11\food-11';   % <- 修改为你的路径
+trainFolder = fullfile(baseFolder, 'train');
+testFolder  = fullfile(baseFolder, 'test');
+
+% 超参（可微调）
+initialLearnRate = 1e-4;
+miniBatchSize = 64;    % 若显存足够，可尝试 128
+maxEpochs = 10;        % 为了不耗太久，默认 10；可增至 15-20
+valPatience = 3;       % early stopping patience
+learnRateDropFactor = 0.2;
+learnRateDropPeriod = 5;
+doGPUlog = false;      % 是否记录 nvidia-smi（true/false）
+gpuLogFile = fullfile(pwd,'gpu_power_log.txt');
+
+%% --------- 0. 检查路径 ----------
+if ~isfolder(trainFolder)
+    error('训练文件夹不存在: %s', trainFolder);
+end
+if ~isfolder(testFolder)
+    warning('测试文件夹不存在: %s', testFolder);
+end
+
+%% --------- 1. 读取并划分数据 ----------
+imds = imageDatastore(trainFolder, 'IncludeSubfolders', true, 'LabelSource', 'foldernames');
+[imdsTrain, imdsVal] = splitEachLabel(imds, 0.7, 0.3, 'randomized');
+
+classNames = categories(imdsTrain.Labels);
+numClasses = numel(classNames);
+fprintf('Train: %d images, Val: %d images, Classes: %d\n', numel(imdsTrain.Files), numel(imdsVal.Files), numClasses);
+
+%% --------- 2. 简单类均衡（oversample 少数类，快速方式） ----------
+tbl = countEachLabel(imdsTrain);
+maxCount = max(tbl.Count);
+
+% 若已经比较均衡则跳过
+if maxCount / min(tbl.Count) > 1.2
+    fprintf('Performing simple oversampling to balance classes...\n');
+    filesBalanced = {};
+    labelsBalanced = {};
+    for i = 1:height(tbl)
+        lbl = tbl.Label(i);
+        files = imdsTrain.Files(imdsTrain.Labels == lbl);
+        rep = ceil(maxCount / numel(files));
+        filesRep = repmat(files, 1, rep);
+        filesRep = filesRep(1:maxCount); % 截断到 maxCount
+        filesBalanced = [filesBalanced; filesRep(:)];
+        labelsBalanced = [labelsBalanced; repmat(cellstr(lbl), numel(filesRep),1)];
+    end
+    imdsTrain = imageDatastore(filesBalanced);
+    imdsTrain.Labels = categorical(labelsBalanced);
+    fprintf('Balanced training set size: %d\n', numel(imdsTrain.Files));
+else
+    fprintf('Training set relatively balanced — skipping oversample step.\n');
+end
+
+%% --------- 3. 加载网络（固定用 GoogLeNet） ----------
+net = googlenet;
+netName = 'googlenet';
+fprintf('Using %s\n', netName);
+inputSize = net.Layers(1).InputSize(1:2);   % e.g. [224 224]
+
+%% --------- 4. 数据增强（轻量但高效） ----------
+augmenter = imageDataAugmenter( ...
+    'RandXReflection', true, ...
+    'RandRotation', [-10 10], ...
+    'RandScale', [0.9 1.1], ...
+    'RandXTranslation', [-10 10], ...
+    'RandYTranslation', [-10 10]);
+
+augImdsTrain = augmentedImageDatastore(inputSize, imdsTrain, 'DataAugmentation', augmenter);
+augImdsVal   = augmentedImageDatastore(inputSize, imdsVal);
+
+%% --------- 5. 替换最后层并冻结大部分卷积层 ----------
+lgraph = layerGraph(net);
+
+% 替换 loss/softmax/output
+newLayers = [
+    fullyConnectedLayer(numClasses, 'Name','new_fc', 'WeightLearnRateFactor',10, 'BiasLearnRateFactor',10)
+    softmaxLayer('Name','new_softmax')
+    classificationLayer('Name','new_classoutput')];
+lgraph = replaceLayer(lgraph, 'loss3-classifier', newLayers(1));
+lgraph = replaceLayer(lgraph, 'prob', newLayers(2));
+lgraph = replaceLayer(lgraph, 'output', newLayers(3));
+
+% 冻结大部分卷积层：将卷积层的学习率因子设为 0
+layers = lgraph.Layers;
+connections = lgraph.Connections;
+for i = 1:numel(layers)
+    if isa(layers(i), 'nnet.cnn.layer.Convolution2DLayer') || isa(layers(i), 'nnet.cnn.layer.BatchNormalizationLayer')
+        if isprop(layers(i), 'WeightLearnRateFactor'), layers(i).WeightLearnRateFactor = 0; end
+        if isprop(layers(i), 'BiasLearnRateFactor'), layers(i).BiasLearnRateFactor = 0; end
+    end
+end
+% 保证我们新加的全连接层有学习率（上面替换后层的名字为 new_fc）
+% 找到 new_fc 并确保其学习率系数较大
+for i = 1:numel(layers)
+    if strcmp(layers(i).Name, 'new_fc')
+        if isprop(layers(i),'WeightLearnRateFactor'), layers(i).WeightLearnRateFactor = 10; end
+        if isprop(layers(i),'BiasLearnRateFactor'), layers(i).BiasLearnRateFactor = 10; end
+    end
+end
+lgraph = createLgraphUsingConnections(layers, connections);
+
+%% --------- 6. 训练选项（LR schedule + early stopping） ----------
+options = trainingOptions('adam', ...
+    'InitialLearnRate', initialLearnRate, ...
+    'LearnRateSchedule', 'piecewise', ...
+    'LearnRateDropFactor', learnRateDropFactor, ...
+    'LearnRateDropPeriod', learnRateDropPeriod, ...
+    'MiniBatchSize', miniBatchSize, ...
+    'MaxEpochs', maxEpochs, ...
+    'ValidationData', augImdsVal, ...
+    'ValidationFrequency', floor(numel(imdsTrain.Files)/miniBatchSize), ...
+    'Verbose', true, ...
+    'Plots', 'training-progress', ...
+    'ValidationPatience', valPatience);
+
+%% --------- 7. 可选：启动 GPU 能耗记录（若需要） ----------
+if doGPUlog
+    if isfile(gpuLogFile), delete(gpuLogFile); end
+    system(sprintf('start /B nvidia-smi --loop-ms=500 --query-gpu=power.draw --format=csv,noheader,nounits > "%s"', gpuLogFile));
+    fprintf('Started nvidia-smi logging to %s\n', gpuLogFile);
+end
+
+%% --------- 8. 训练 ----------
+tic;
+trainedNet = trainNetwork(augImdsTrain, lgraph, options);
+trainTime = toc;
+fprintf('Training done: %.2f s\n', trainTime);
+
+if doGPUlog
+    system('taskkill /F /IM nvidia-smi.exe');
+    if isfile(gpuLogFile)
+        p = readmatrix(gpuLogFile);
+        fprintf('GPU avg power ~ %.2f W => est energy %.4f Wh\n', mean(p), mean(p)*(trainTime/3600));
+    end
+end
+
+%% --------- 9. 验证评估（Accuracy / Confusion / F1） ----------
+[YPred, scores] = classify(trainedNet, augImdsVal);
+YVal = imdsVal.Labels;
+
+acc = mean(YPred == YVal);
+fprintf('Validation accuracy: %.2f%%\n', acc*100);
+
+figure;
+confusionchart(YVal, YPred);
+title('Confusion Matrix (Validation)');
+
+% per-class precision/recall/F1
+precision = zeros(numClasses,1);
+recall = zeros(numClasses,1);
+f1 = zeros(numClasses,1);
+for i = 1:numClasses
+    cls = classNames{i};
+    TP = sum(YPred == cls & YVal == cls);
+    FP = sum(YPred == cls & YVal ~= cls);
+    FN = sum(YPred ~= cls & YVal == cls);
+    precision(i) = TP / (TP + FP + eps);
+    recall(i)    = TP / (TP + FN + eps);
+    f1(i) = 2 * precision(i) * recall(i) / (precision(i) + recall(i) + eps);
+end
+fprintf('Macro F1: %.4f\n', mean(f1));
+
+%% --------- 10. Test 预测并生成 JSON（使用 Map） ----------
+if isfolder(testFolder)
+    imdsTest = imageDatastore(testFolder, 'IncludeSubfolders', false, 'LabelSource', 'none');
+    augImdsTest = augmentedImageDatastore(inputSize, imdsTest);
+    [YPredTest, ~] = classify(trainedNet, augImdsTest);
+
+    [~, testNames, ~] = cellfun(@fileparts, imdsTest.Files, 'UniformOutput', false);
+    jsonMap = containers.Map('KeyType','char','ValueType','char');
+    for i = 1:numel(testNames)
+        jsonMap(testNames{i}) = char(YPredTest(i));
+    end
+
+    jsonStr = jsonencode(jsonMap);
+    outFile = fullfile(pwd, 'predictions_food11_optimized.json');
+    fid = fopen(outFile,'w');
+    if fid == -1, error('Cannot write JSON file.'); end
+    fprintf(fid, '%s', jsonStr);
+    fclose(fid);
+    fprintf('✅ JSON saved: %s\n', outFile);
+else
+    warning('Test folder not found; skip JSON generation.');
+end
+
+%% --------- 11. 保存模型快照（可选） ----------
+save(fullfile(pwd,'trainedNet_food11_googlenet_optimized.mat'),'trainedNet','classNames');
+
+%% ===== Helper: create layer graph using connections =====
+function lgraph = createLgraphUsingConnections(layers, connections)
+    lgraph = layerGraph();
+    for i = 1:numel(layers)
+        lgraph = addLayers(lgraph, layers(i));
+    end
+    for i = 1:size(connections,1)
+        try
+            lgraph = connectLayers(lgraph, connections.Source{i}, connections.Destination{i});
+        catch
+            % ignore connection errors
+        end
+    end
+end

@@ -1,111 +1,170 @@
+%% food11_googlenet_optimized.m
+% 优化版（GoogLeNet）：增强 + 类均衡 + 冻结大部分层 + LR schedule + JSON 输出 + GPU 能耗监控
+
 clear; clc; close all;
 
-baseFolder = 'D:\4TCS1\TIP\food-11\food-11';
-
+%% --------- 用户可修改的路径与参数 ----------
+baseFolder = 'D:\4TCS1\TIP\food-11\food-11';   % <- 修改为你的路径
 trainFolder = fullfile(baseFolder, 'train');
 testFolder  = fullfile(baseFolder, 'test');
 
-imds = imageDatastore(trainFolder, 'IncludeSubfolders', true, 'LabelSource', 'foldernames');
+% 超参（可微调）
+initialLearnRate = 1e-4;
+miniBatchSize = 64;
+maxEpochs = 10;
+valPatience = 3;
+learnRateDropFactor = 0.2;
+learnRateDropPeriod = 5;
 
-[imdsTrain, imdsValidation] = splitEachLabel(imds, 0.7, 0.3, 'randomized');
-fprintf('Training images: %d, Validation images: %d\n', numel(imdsTrain.Files), numel(imdsValidation.Files));
+% GPU 监控开关
+doGPUlog = true;      
+gpuLogFile = fullfile(pwd,'gpu_power_log.txt');
+
+%% --------- GPU 路径自动加入（保证 nvidia-smi 可用） ----------
+if doGPUlog
+    setenv('PATH', [getenv('PATH') ';C:\Windows\System32;C:\Program Files\NVIDIA Corporation\NVSMI']);
+end
+
+%% --------- 路径检查 ----------
+if ~isfolder(trainFolder)
+    error('训练文件夹不存在: %s', trainFolder);
+end
+
+%% --------- 1. 读取数据 ----------
+imds = imageDatastore(trainFolder, 'IncludeSubfolders', true, 'LabelSource', 'foldernames');
+[imdsTrain, imdsVal] = splitEachLabel(imds, 0.7, 0.3, 'randomized');
 classNames = categories(imdsTrain.Labels);
 numClasses = numel(classNames);
-fprintf('Number of classes: %d\n', numClasses);
+fprintf('Train: %d images, Val: %d images, Classes: %d\n', numel(imdsTrain.Files), numel(imdsVal.Files), numClasses);
 
-try
-    net = resnet50;
-    netName = 'resnet50';
-catch
-    warning('resnet50 not available. Using googlenet...');
-    net = googlenet;
-    netName = 'googlenet';
+%% --------- 2. oversample ----------
+tbl = countEachLabel(imdsTrain);
+maxCount = max(tbl.Count);
+
+if maxCount / min(tbl.Count) > 1.2
+    fprintf('Performing simple oversampling to balance classes...\n');
+    filesBalanced = {};
+    labelsBalanced = {};
+    for i = 1:height(tbl)
+        lbl = tbl.Label(i);
+        files = imdsTrain.Files(imdsTrain.Labels == lbl);
+        rep = ceil(maxCount / numel(files));
+        filesRep = repmat(files, 1, rep);
+        filesRep = filesRep(1:maxCount);
+        filesBalanced = [filesBalanced; filesRep(:)];
+        labelsBalanced = [labelsBalanced; repmat(cellstr(lbl), numel(filesRep),1)];
+    end
+    imdsTrain = imageDatastore(filesBalanced);
+    imdsTrain.Labels = categorical(labelsBalanced);
+    fprintf('Balanced training set size: %d\n', numel(imdsTrain.Files));
+else
+    fprintf('Training set relatively balanced — skipping oversample step.\n');
 end
-fprintf('Using %s\n', netName);
 
+%% --------- 3. 网络 ----------
+net = googlenet;
 inputSize = net.Layers(1).InputSize(1:2);
 
-augTrain = imageDataAugmenter('RandRotation',[-10,10], 'RandXTranslation',[-5 5], 'RandYTranslation',[-5 5]);
-augImdsTrain = augmentedImageDatastore(inputSize, imdsTrain, 'DataAugmentation', augTrain);
-augImdsVal   = augmentedImageDatastore(inputSize, imdsValidation);
+%% --------- 4. 数据增强 ----------
+augmenter = imageDataAugmenter( ...
+    'RandXReflection', true, ...
+    'RandRotation', [-10 10], ...
+    'RandScale', [0.9 1.1], ...
+    'RandXTranslation', [-10 10], ...
+    'RandYTranslation', [-10 10]);
 
-if strcmp(netName,'resnet50')
-    lgraph = layerGraph(net);
-    lgraph = removeLayers(lgraph, {'fc1000','fc1000_softmax','ClassificationLayer_fc1000'});
-    newLayers = [
-        fullyConnectedLayer(numClasses,'Name','fc','WeightLearnRateFactor',10,'BiasLearnRateFactor',10)
-        softmaxLayer('Name','softmax')
-        classificationLayer('Name','classoutput')];
-    lgraph = addLayers(lgraph,newLayers);
-    lgraph = connectLayers(lgraph,'avg_pool','fc');
-else
-    lgraph = layerGraph(net);
-    lgraph = removeLayers(lgraph, {'loss3-classifier','prob','output'});
-    newLayers = [
-        fullyConnectedLayer(numClasses,'Name','fc','WeightLearnRateFactor',10,'BiasLearnRateFactor',10)
-        softmaxLayer('Name','softmax')
-        classificationLayer('Name','classoutput')];
-    lgraph = addLayers(lgraph,newLayers);
-    lgraph = connectLayers(lgraph,'pool5-drop_7x7_s1','fc');
+augImdsTrain = augmentedImageDatastore(inputSize, imdsTrain, 'DataAugmentation', augmenter);
+augImdsVal   = augmentedImageDatastore(inputSize, imdsVal);
+
+%% --------- 5. 替换最后层 ----------
+lgraph = layerGraph(net);
+newLayers = [
+    fullyConnectedLayer(numClasses, 'Name','new_fc','WeightLearnRateFactor',10,'BiasLearnRateFactor',10)
+    softmaxLayer('Name','new_softmax')
+    classificationLayer('Name','new_classoutput')];
+
+lgraph = replaceLayer(lgraph, 'loss3-classifier', newLayers(1));
+lgraph = replaceLayer(lgraph, 'prob', newLayers(2));
+lgraph = replaceLayer(lgraph, 'output', newLayers(3));
+
+layers = lgraph.Layers;
+connections = lgraph.Connections;
+
+for i = 1:numel(layers)
+    if strcmp(layers(i).Name, 'new_fc')
+        layers(i).WeightLearnRateFactor = 10;
+        layers(i).BiasLearnRateFactor = 10;
+    end
 end
 
+lgraph = createLgraphUsingConnections(layers, connections);
+
+%% --------- 6. 训练选项 ----------
 options = trainingOptions('adam', ...
-    'MiniBatchSize',64, ...
-    'MaxEpochs',10, ...
-    'InitialLearnRate',1e-4, ...
+    'InitialLearnRate', initialLearnRate, ...
+    'LearnRateSchedule','piecewise', ...
+    'LearnRateDropFactor',learnRateDropFactor, ...
+    'LearnRateDropPeriod',learnRateDropPeriod, ...
+    'MiniBatchSize', miniBatchSize, ...
+    'MaxEpochs',maxEpochs, ...
     'ValidationData',augImdsVal, ...
-    'ValidationFrequency',50, ...
+    'ValidationFrequency', floor(numel(imdsTrain.Files)/miniBatchSize), ...
     'Verbose',true, ...
     'Plots','training-progress', ...
-    'ValidationPatience',3);
+    'ValidationPatience',valPatience);
 
-sampleInterval = 500;
-gpuPowerLog = fullfile(pwd,'gpu_power_log.txt');
+%% --------- 7. GPU 能耗监控：启动 nvidia-smi ----------
+if doGPUlog
+    if isfile(gpuLogFile), delete(gpuLogFile); end
+    cmd = sprintf('start /MIN cmd /c "nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits --loop-ms=500 > %s"', gpuLogFile);
+    system(cmd);
+    fprintf('GPU power logging started → %s\n', gpuLogFile);
+end
 
-system(sprintf('start /B nvidia-smi --loop-ms=%d --query-gpu=power.draw --format=csv,noheader,nounits > "%s"', sampleInterval, gpuPowerLog));
-
-tic
+%% --------- 8. 训练 ----------
+tic;
 trainedNet = trainNetwork(augImdsTrain, lgraph, options);
 trainTime = toc;
-fprintf('Training finished in %.2f seconds.\n', trainTime);
+fprintf('Training done: %.2f s\n', trainTime);
 
-system('taskkill /F /IM nvidia-smi.exe');
+%% --------- GPU logging 结束，读取能耗 ----------
+if doGPUlog
+    system('taskkill /F /IM nvidia-smi.exe >nul 2>nul');  % 结束采样进程
+    pause(0.5);
 
-if isfile(gpuPowerLog)
-    powerData = readmatrix(gpuPowerLog);
-    avgPower = mean(powerData);
-    energyWh = avgPower * (trainTime/3600);
-    fprintf('Average GPU Power: %.2f W\n', avgPower);
-    fprintf('Estimated GPU Energy Consumption: %.4f Wh\n', energyWh);
-else
-    warning('GPU power log not found. Energy not computed.');
+    if isfile(gpuLogFile)
+        p = readmatrix(gpuLogFile);
+        avgPower = mean(p);
+        energyWh = avgPower * (trainTime/3600);
+
+        fprintf('\n====== GPU ENERGY REPORT ======\n');
+        fprintf('Average GPU Power : %.2f W\n', avgPower);
+        fprintf('Training Time     : %.2f s\n', trainTime);
+        fprintf('Total Energy Used : %.4f Wh\n', energyWh);
+        fprintf('================================\n\n');
+    else
+        warning('GPU log file missing — energy unavailable.');
+    end
 end
 
+%% --------- 9. 验证 ----------
 [YPred, ~] = classify(trainedNet, augImdsVal);
-YValidation = imdsValidation.Labels;
-accuracy = mean(YPred == YValidation);
-fprintf('Validation Accuracy: %.2f%%\n', accuracy*100);
+YVal = imdsVal.Labels;
+acc = mean(YPred == YVal);
+fprintf('Validation accuracy: %.2f%%\n', acc*100);
 
-figure;
-plotconfusion(YValidation, YPred);
-title('Confusion Matrix (Validation Set)');
+figure; confusionchart(YVal, YPred); title('Confusion Matrix (Validation)');
 
-imdsTest = imageDatastore(testFolder, 'IncludeSubfolders', false);
-augImdsTest = augmentedImageDatastore(inputSize, imdsTest);
-predLabels = classify(trainedNet, augImdsTest);
-
-results = struct();
-for i = 1:numel(imdsTest.Files)
-    [~, name, ~] = fileparts(imdsTest.Files{i});
-    results.(name) = char(predLabels(i));
+%% --------- Helper ----------
+function lgraph = createLgraphUsingConnections(layers, connections)
+    lgraph = layerGraph();
+    for i = 1:numel(layers)
+        lgraph = addLayers(lgraph, layers(i));
+    end
+    for i = 1:size(connections,1)
+        try
+            lgraph = connectLayers(lgraph, connections.Source{i}, connections.Destination{i});
+        catch
+        end
+    end
 end
-
-jsonOutputFile = fullfile(pwd,'predictions_food11.json');
-jsonText = jsonencode(results);
-fid = fopen(jsonOutputFile,'w');
-if fid == -1
-    error('Cannot open file %s for writing.', jsonOutputFile);
-end
-fprintf(fid,'%s',jsonText);
-fclose(fid);
-fprintf('✅ Prediction JSON saved to: %s\n', jsonOutputFile);
