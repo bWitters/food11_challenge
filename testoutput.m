@@ -24,13 +24,9 @@ numClasses = numel(classNames);
 fprintf('Training images: %d, Validation images: %d\n', numel(imdsTrain.Files), numel(imdsVal.Files));
 fprintf('Number of classes: %d\n', numClasses);
 
-%% ======= Load Network (ResNet50 → fallback GoogLeNet) =======
+%% ======= Load Network  =======
 
 try
-    net = resnet50;
-    netName = 'resnet50';
-catch
-    warning('resnet50 unavailable, using googlenet');
     net = googlenet;
     netName = 'googlenet';
 end
