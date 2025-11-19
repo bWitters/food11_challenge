@@ -40,12 +40,16 @@ function I = advancedAugmenter(filename, targetSize)
         I = imgaussfilt(I, 0.5 + rand);
     end
 
-    % Cutout
+  % --- Cutout sécurisé ---
     if rand > 0.5
         sz = size(I);
-        cut = randi([20 50]);
+        maxCut = floor(min(sz(1:2))/2);
+        cut = randi([5 maxCut]);  % taille adaptée à l’image
+
+        % positions valides
         x = randi([1 sz(2)-cut]);
         y = randi([1 sz(1)-cut]);
-        I(y:y+cut, x:x+cut, :) = rand;
+
+        I(y:y+cut, x:x+cut, :) = rand; % masque
     end
 end
