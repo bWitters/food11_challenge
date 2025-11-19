@@ -3,13 +3,13 @@ numClasses = numel(categories(imdsTrain.Labels));
 
 % appliquer augmentation avancée uniquement sur le train 
 imdsTrain.ReadFcn = @(filename) advancedAugmenter(filename, inputSize(1:2));
-
 % validation normalisée
 imdsValidation.ReadFcn = @(filename) imresize(imread(filename), inputSize(1:2));
 
 augimdsTrain = augmentedImageDatastore(inputSize, imdsTrain);
 augimdsValidation = augmentedImageDatastore(inputSize, imdsValidation);
 
+% chargement du réseau enet
 net = efficientnetb0;
 lgraph = layerGraph(net);
 
