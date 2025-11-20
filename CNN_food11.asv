@@ -34,10 +34,10 @@ lgraph = replaceLayer(lgraph, 'ClassificationLayer_predictions', newClassLayer);
 
 
 miniBatchSize = 128;
-initialLearnRate = 1e-4;
+initialLearnRate = 0.0001;
 
 options = trainingOptions("adam", ...
-    "L2Regularization",0.05,...
+    "L2Regularization",0.001,...
     InitialLearnRate=initialLearnRate, ...
     MiniBatchSize=miniBatchSize, ...
     MaxEpochs=20, ... 
@@ -47,9 +47,21 @@ options = trainingOptions("adam", ...
     Verbose=false, ...
     Plots="training-progress");
 
+sampleInterval = 500; % 采样间隔 (毫秒)
+gpuPowerLog = fullfile(pwd,'gpu_power_log.txt');
+% 确保日志文件不存在，以便重新开始记录
+if isfile(gpuPowerLog); delete(gpuPowerLog); end
 
+% 启动 GPU 功率记录（注意：此命令假设在 Windows 环境）
+fprintf('Starting GPU power logging to: %s\n', gpuPowerLog);
+system(sprintf('start /B nvidia-smi --loop-ms=%d --query-gpu=power.draw --format=csv,noheader,nounits > "%s"', sampleInterval, gpuPowerLog));
+
+% 记录训练开始时间
+tic;
+fprintf('Starting network training...\n');
 net = trainNetwork(augimdsTrain, lgraph, options);
-
+fprintf('Training finished.\n');
+trainTime = toc; 
 % Calculer f1-score,evaluer le reseau
 [YPred, scores] = classify(net, augimdsValidation);
 YValidation = imdsValidation.Labels;

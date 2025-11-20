@@ -34,10 +34,10 @@ lgraph = replaceLayer(lgraph, 'ClassificationLayer_predictions', newClassLayer);
 
 
 miniBatchSize = 128;
-initialLearnRate = 1e-4;
+initialLearnRate = 0.0001;
 
 options = trainingOptions("adam", ...
-    "L2Regularization",0.05,...
+    "L2Regularization",0.001,...
     InitialLearnRate=initialLearnRate, ...
     MiniBatchSize=miniBatchSize, ...
     MaxEpochs=20, ... 
@@ -46,10 +46,43 @@ options = trainingOptions("adam", ...
     ValidationFrequency=5, ... 
     Verbose=false, ...
     Plots="training-progress");
+%Calculer l'energie utilisee
+sampleInterval = 500; 
+gpuPowerLog = fullfile(pwd,'gpu_power_log.txt');
+
+if isfile(gpuPowerLog); delete(gpuPowerLog); end
 
 
+fprintf('Starting GPU power logging to: %s\n', gpuPowerLog);
+system(sprintf('start /B nvidia-smi --loop-ms=%d --query-gpu=power.draw --format=csv,noheader,nounits > "%s"', sampleInterval, gpuPowerLog));
+
+
+tic;
+fprintf('Starting network training...\n');
 net = trainNetwork(augimdsTrain, lgraph, options);
+fprintf('Training finished.\n');
 
+trainTime = toc; 
+pause(2);
+fprintf('Total training time: %.2f seconds\n', trainTime);
+if isfile(gpuPowerLog)
+    powerData = readmatrix(gpuPowerLog);
+    
+    if isempty(powerData) || numel(powerData) < 2
+        warning('GPU power log is empty or insufficient. Energy not computed.');
+    else
+        avgPower = mean(powerData);
+        
+        energyWh = avgPower * (trainTime/3600); 
+
+        fprintf('\n--- GPU Energy Analysis ---\n');
+        fprintf('Average GPU Power: %.2f W\n', avgPower);
+        fprintf('Estimated GPU Energy Consumption: %.4f Wh\n', energyWh);
+        fprintf('---------------------------\n');
+    end
+else
+    warning('GPU power log not found. Energy not computed.');
+end
 % Calculer f1-score,evaluer le reseau
 [YPred, scores] = classify(net, augimdsValidation);
 YValidation = imdsValidation.Labels;
@@ -121,30 +154,4 @@ end
 
 jsonStr = jsonencode(jsonMap);
 
-% enregistrer le fichier json (resultat)
-outputFile = fullfile(pwd, "test_predictions_Restnet_RELU5_10-2.json"); 
-fid = fopen(outputFile, 'w');
-if fid == -1
-    error('Erreur chemin,peut pas créer le fichier json');
-end
-fprintf(fid, '%s', jsonStr);
-fclose(fid);
-fprintf('\n json enregistré %s\n', outputFile);
-
-
-if isfile(gpuPowerLog)
-powerData = readmatrix(gpuPowerLog);
-avgPower = mean(powerData);
-energyWh = avgPower * (trainTime/3600); % Wh
-fprintf('Average GPU Power: %.2f W\n', avgPower);
-fprintf('Estimated GPU Energy Consumption: %.4f Wh\n', energyWh);
-else
-warning('GPU power log not found. Energy not computed.');
-end
-
-% temps entre echantillonage en echelle ms
-sampleInterval = 500; 
-gpuPowerLog = fullfile(pwd,'gpu_power_log.txt');
-% commencer enregistrer la puissance de GPU
-system(sprintf('start /B nvidia-smi --loop-ms=%d --query-gpu=power.draw --format=csv,noheader,nounits > "%s"', sampleInterval, gpuPowerLog));
 
