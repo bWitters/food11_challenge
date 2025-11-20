@@ -32,31 +32,22 @@ fprintf("Validation images: %d\n", numel(imdsVal.Labels));
 inputSize = netTrained.Layers(1).InputSize;
 
 augVal = augmentedImageDatastore(inputSize(1:2), imdsVal);
-valFile = augVal.Files;
 
 %% -------------------------- Run Classification --------------------
 
 fprintf("\nClassifying validation set...\n");
-YPred = {};
-YTrue = {};
-for k = 1:length(valFile)
-  currentFile = valFile(k);
-  %fprintf(1, 'Now reading %s\n', currentFile{1});
-  imageArray = imread(currentFile{1});
-  YPred = [YPred, string(scores2label(predict(netTrained, im2double(imresize(imageArray,inputSize(1:2)))),classNames))];
-  labelTrue = split(currentFile{1},"\");
-  YTrue = [YTrue, string(labelTrue{end-1})];
-end
 
-length(YPred)
-length(YTrue)
+[YPred, ~] = classify(netTrained, augVal);
+YVal = imdsVal.Labels;
+
+accuracy = mean(YPred == YVal);
+fprintf('Validation Accuracy: %.2f%%\n', accuracy*100);
 
 %% -------------------------- Confusion Matrix ----------------------
 
 figure;
-cm = confusionchart(YTrue, YPred);
-cm.Title = "Confusion Matrix - Validation Set";
-cm.FontSize = 12;
+plotconfusion(YVal, YPred);
+title('Confusion Matrix – Validation');
 
 %% --------------------------- Metrics ------------------------------
 
